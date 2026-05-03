@@ -1,5 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -7,14 +8,19 @@ from datetime import datetime, timedelta
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    if request.method == "OPTIONS":
+        response = JSONResponse(content={})
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 STOCKS = [
     ("005930.KS","삼성전자","KOSPI"),("000660.KS","SK하이닉스","KOSPI"),
@@ -92,6 +98,9 @@ def analyze(ticker, name, market):
         if df is None or len(df) < 60:
             return None
 
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
         df.index = pd.to_datetime(df.index)
         wdf = to_weekly(df)
         ddf = df[df.index >= str(start_short.date())].copy()
@@ -101,22 +110,19 @@ def analyze(ticker, name, market):
 
         current_price = int(ddf['Close'].iloc[-1])
 
-        # 주봉 스토캐스틱
         wK1, wD1 = slow_stoch(wdf, 20, 3, 10)
         wK2, wD2 = slow_stoch(wdf, 10, 3, 5)
-        w_rising = is_rising_lows(wK1.dropna()) or is_rising_lows(wK2.dropna())
+        w_rising  = is_rising_lows(wK1.dropna()) or is_rising_lows(wK2.dropna())
         w_bearish = is_bearish_div(wdf['Close'], wK1.dropna())
 
-        # 일봉 스토캐스틱
         dK1, dD1 = slow_stoch(ddf, 20, 3, 10)
         dK2, dD2 = slow_stoch(ddf, 10, 3, 5)
         dK3, dD3 = slow_stoch(ddf, 5,  3, 3)
-        d_rising = is_rising_lows(dK1.dropna()) and is_rising_lows(dK2.dropna())
+        d_rising  = is_rising_lows(dK1.dropna()) and is_rising_lows(dK2.dropna())
 
-        # 골든크로스
         golden = (
-            (dK1.iloc[-2] < dD1.iloc[-2] and dK1.iloc[-1] >= dD1.iloc[-1]) or
-            (dK2.iloc[-2] < dD2.iloc[-2] and dK2.iloc[-1] >= dD2.iloc[-1])
+            (float(dK1.iloc[-2]) < float(dD1.iloc[-2]) and float(dK1.iloc[-1]) >= float(dD1.iloc[-1])) or
+            (float(dK2.iloc[-2]) < float(dD2.iloc[-2]) and float(dK2.iloc[-1]) >= float(dD2.iloc[-1]))
         )
 
         cur_wK1 = round(float(wK1.dropna().iloc[-1]), 1)
@@ -125,41 +131,31 @@ def analyze(ticker, name, market):
         cur_dK2 = round(float(dK2.dropna().iloc[-1]), 1)
         cur_dK3 = round(float(dK3.dropna().iloc[-1]), 1)
 
-        # 판정
         if w_bearish:
             verdict = "warn"
-            reason = f"주가 고점 상승 중인데 스토캐스틱 고점이 낮아지고 있어요. 베어리시 다이버전스 — 진입 위험."
+            reason  = "주가 고점 상승 중인데 스토캐스틱 고점이 낮아지고 있어요. 베어리시 다이버전스 — 진입 위험."
         elif w_rising and d_rising and golden:
             verdict = "entry"
-            reason = f"주봉 저점 상승 확인 + 일봉 (20,10)·(10,5) 저점 동시 상승 + 골든크로스 발생. 진입 타이밍이에요."
+            reason  = "주봉 저점 상승 확인 + 일봉 (20,10)·(10,5) 저점 동시 상승 + 골든크로스 발생. 진입 타이밍이에요."
         elif w_rising and d_rising:
             verdict = "wait"
-            reason = f"주봉·일봉 저점 상승 패턴 모두 확인됐어요. 골든크로스 나오는 시점 기다리면 돼요."
+            reason  = "주봉·일봉 저점 상승 패턴 모두 확인됐어요. 골든크로스 나오는 시점 기다리면 돼요."
         elif w_rising:
             verdict = "wait"
-            reason = f"주봉 저점 상승 패턴 보여요. 일봉에서도 패턴 형성되면 진입 검토하세요."
+            reason  = "주봉 저점 상승 패턴 보여요. 일봉에서도 패턴 형성되면 진입 검토하세요."
         else:
             verdict = "none"
-            reason = f"아직 주봉·일봉 모두 패턴 미형성이에요."
+            reason  = "아직 주봉·일봉 모두 패턴 미형성이에요."
 
         return {
-            "name": name,
-            "market": market,
-            "ticker": ticker,
-            "price": current_price,
-            "verdict": verdict,
-            "reason": reason,
-            "w_rising": w_rising,
-            "d_rising": d_rising,
-            "golden": golden,
-            "bearish": w_bearish,
-            "wK1": cur_wK1,
-            "wK2": cur_wK2,
-            "dK1": cur_dK1,
-            "dK2": cur_dK2,
-            "dK3": cur_dK3,
+            "name": name, "market": market, "ticker": ticker,
+            "price": current_price, "verdict": verdict, "reason": reason,
+            "w_rising": bool(w_rising), "d_rising": bool(d_rising),
+            "golden": bool(golden), "bearish": bool(w_bearish),
+            "wK1": cur_wK1, "wK2": cur_wK2,
+            "dK1": cur_dK1, "dK2": cur_dK2, "dK3": cur_dK3,
         }
-    except Exception as e:
+    except Exception:
         return None
 
 @app.get("/scan")
@@ -169,7 +165,6 @@ def scan():
         r = analyze(ticker, name, market)
         if r:
             results.append(r)
-
     order = {"entry": 0, "wait": 1, "none": 2, "warn": 3}
     results.sort(key=lambda x: order.get(x["verdict"], 4))
     return {"results": results, "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
